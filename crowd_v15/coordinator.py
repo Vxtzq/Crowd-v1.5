@@ -34,6 +34,7 @@ from typing import Any
 import numpy as np
 
 from . import protocol
+from .plain import check_plain_parameter_names
 from .store import ModelStore
 
 
@@ -95,6 +96,7 @@ class Coordinator:
 
     def bootstrap(self, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
         """Install the model a coordinator serves before the first round."""
+        check_plain_parameter_names(tensors)
         digest = self.store.save_weights(tensors)
         self._momentum = {}
         self._state = {

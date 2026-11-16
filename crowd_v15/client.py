@@ -41,6 +41,7 @@ import torch
 from . import codec, protocol
 from .dust import DustConfig, DustOptimizer, dust_gradients, probe_cosine
 from .model import GPT, ModelConfig, canonical_params
+from .plain import check_plain_parameter_names
 from .store import weights_digest
 from .tasks import identity_batch, induction_batch, load_tokens, random_batch, token_batch
 
@@ -159,6 +160,7 @@ class DustClient:
             raise ClientError(
                 f"weights digest {digest[:12]} does not match the manifest {manifest['baseSha256'][:12]}"
             )
+        check_plain_parameter_names(tensors)
         if sorted(tensors) != sorted(self._param_names()):
             raise ClientError("served parameter names do not match the local model")
         with torch.no_grad():

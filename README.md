@@ -4,10 +4,45 @@ Pretraining by **DUST** â€” perturbing activations instead of backpropagating â€
 a coordinator that accepts DUST and backprop submissions on **separate routes**.
 
 This is the ground work for the v1.5 pivot: v1 trained a 658M+350M model with
-backprop and shipped dense weight deltas. v1.5 trains a 1B dense model (no
-engrams) and lets any device contribute, because DUST needs no backward pass, no
-optimizer state and no gradient buffer. Backprop stays in the tree as a route
-that is simply unused when DUST is active.
+backprop and shipped dense weight deltas. v1.5 trains a **1B plain transformer**
+and lets any device contribute, because DUST needs no backward pass, no optimizer
+state and no gradient buffer. Backprop stays in the tree as a route that is simply
+unused when DUST is active.
+
+## Plain transformer, no engrams
+
+The model is a plain decoder-only transformer: embeddings, pre-norm blocks
+(RMSNorm, fused-QKV attention, SwiGLU MLP), a final norm and a tied output head.
+Nothing else -- **no engram table, no MoE, no adapters, no LoRA**.
+
+That is a requirement, not a preference. The v1 engram was a 350M-row lookup table
+trained by `SparseAdam` over visited rows. A DUST step estimates one scalar reward
+per population member and turns it into a weight-shaped direction; applying that
+to rows the forward pass never touched is meaningless, and the damage would not
+show up in the loss until much later. So a sparse component with its own update
+rule is not something to tune around -- it is something to remove.
+
+The rule is enforced in code, in three places:
+
+- `assert_plain(model)` checks the module tree and returns a parameter breakdown;
+- `Coordinator.bootstrap()` refuses any checkpoint whose parameter names contain
+  `engram`, `moe`, `expert`, `router`, `lora` or `adapter` (400 at the HTTP edge);
+- `DustClient.sync()` refuses a manifest that advertises such a tensor, before it
+  downloads 2.5 GB of it.
+
+| preset | layers | d_model | heads | context | parameters |
+|---|---|---|---|---|---|
+| `tiny` | 4 | 128 | 4 | 64 | 1,082,496 |
+| `10m` | 6 | 256 | 8 | 512 | 7,343,360 |
+| `100m` | 12 | 768 | 12 | 1024 | 116,411,136 |
+| **`1b`** | **15** | **2048** | **16** | **2048** | **1,015,085,056** |
+| `1b-deep` | 20 | 2048 | 16 | 2048 | 1,350,649,856 |
+| `2b` | 32 | 2304 | 18 | 2048 | 2,727,495,936 |
+
+`1b` is the literal billion. `1b-deep` is the sizing the maintainer's
+`train_dust.py` calls "1b", kept so earlier measurements stay comparable. Counts
+include the tied embedding once and every norm weight; the analytic count, the
+built model and `param_report()` are asserted equal for every preset.
 
 ## Why the two halves are separable
 
@@ -140,9 +175,31 @@ simply resubmit.
 - End to end: two clients -> one round -> weights move -> new digest served ->
   the next round verifies against it.
 
+## Measured on gfx1150 (1B plain transformer, aptai2)
+
+`1b` = 1,015,085,056 parameters, bf16, ROCm 7.2 / torch 2.14.1+rocm7.2, 30.48 GB
+shared RAM. No code change was needed to run on ROCm: torch reports
+`device.type == "cuda"`, so the bf16 paths light up unchanged.
+
+| measurement | result |
+|---|---|
+| weights at bf16 | 1.89 GB |
+| forward, seq 8 | 0.293 s, peak **1.92 GB** allocated / **1.96 GB** reserved |
+| DUST step, seq 32, bs 1, population 2 | **8.18 s**, 153 forwards, **6.06 GB** peak reserved |
+| fp32 gradient buffer for the whole model | 3.78 GB |
+| evidence throughput of that step | 64 tokens = **7.8 tok/s** |
+
+So a 1B plain transformer takes a real DUST step on a 30 GB APU with ~24 GB
+headroom -- the claim backprop cannot make there (AdamW fp32 m/v alone is 8 GB,
+before the graph). The cost driver is visible in the same numbers: per-layer
+passes turn one token of evidence into ~2.4 forwards of a 1B model (153 / 64), so
+throughput is dominated by the pass structure, not the arithmetic.
+
 ## Honest limits
 
-- The estimator is validated on tiny CPU models. Nothing here proves the
+- The estimator is validated on tiny CPU models (cosine 0.89 at 1 layer, 0.55 at
+  two with per-layer draws); the 1B numbers below are *mechanism* numbers from a
+  two-draw probe, not a quality claim. Nothing here proves the
   paper's claim that larger models are *more* population-efficient at 1B; that
   needs the GPU box and the falsifiable gates (does a 1B-shaped step fit; does
   gradient alignment hold as size and tokens grow; how many draws to match

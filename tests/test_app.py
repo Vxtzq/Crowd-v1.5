@@ -168,3 +168,12 @@ def test_bootstrap_rejects_non_safetensors(booted):
     test_client, _, _ = booted
     reply = test_client.post("/admin/bootstrap", content=b"not a safetensors file", headers=ADMIN)
     assert reply.status_code == 400
+
+
+def test_bootstrap_refuses_a_checkpoint_that_is_not_a_plain_transformer(client):
+    test_client, _ = client
+    tensors = model_tensors()
+    tensors["engram.table.weight"] = np.zeros((4, 4), dtype=np.float32)
+    reply = test_client.post("/admin/bootstrap", content=safetensors_bytes(tensors), headers=ADMIN)
+    assert reply.status_code == 400
+    assert "plain transformer" in reply.json()["detail"]

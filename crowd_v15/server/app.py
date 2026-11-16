@@ -201,7 +201,10 @@ def create_app(root: str | os.PathLike[str] | None = None,
             raise HTTPException(status_code=400, detail=f"not a safetensors file: {exc}")
         if not tensors:
             raise HTTPException(status_code=400, detail="no tensors in the body")
-        return coordinator.bootstrap(tensors)
+        try:
+            return coordinator.bootstrap(tensors)
+        except ValueError as exc:  # not a plain transformer
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @app.post("/admin/routes")
     def admin_routes(request: Request, dust: bool | None = None, backprop: bool | None = None) -> dict[str, Any]:
