@@ -74,6 +74,10 @@ class ClientConfig:
     device: str = "cpu"
     compute_dtype: str = "float32"
     local_steps: int = 1
+    # Independent DUST draws at the *same* weights, averaged before upload.
+    # Variance falls as 1/k, the payload does not change, and (unlike
+    # local_steps) the estimate is not measured at a moved point.
+    draws: int = 1
     seed: int = 0
     timeout: float = DEFAULT_TIMEOUT
     dry_run: bool = False
@@ -90,6 +94,8 @@ class ClientConfig:
             raise ValueError("--data is required for task=copy")
         if self.local_steps < 1:
             raise ValueError("local_steps must be at least 1")
+        if self.draws < 1:
+            raise ValueError("draws must be at least 1")
 
 
 def _http(url: str, *, method: str = "GET", body: bytes | None = None,
@@ -238,6 +244,7 @@ class DustClient:
             "seed": int(self.config.seed),
             "step": int(stats.get("step", 0)),
             "localSteps": int(self.config.local_steps),
+            "averagedDraws": int(self.config.draws),
             "params": int(sum(sizes)),
         }
         if feedback_stats is not None:
@@ -269,25 +276,39 @@ class DustClient:
 
     # ---- loop ------------------------------------------------------------
 
+    def _one_draw(self, step: int, *, first: bool, averaged):
+        """One DUST estimate, with the timing and probe bookkeeping ``run`` needs."""
+        started = time.perf_counter()
+        grads, stats = self.gradient(step=step)
+        stats["seconds"] = round(time.perf_counter() - started, 4)
+        if stats["seconds"] > 0:
+            stats["tokensPerSecond"] = round(float(stats["tokens"]) / stats["seconds"], 1)
+        if self.config.probe_cosine and first:
+            idx, tgt = self.batch()
+            stats["cosine"] = probe_cosine(self.model, self.dust_cfg, idx, tgt,
+                                           base_seed=stats["baseSeed"], step=step)
+        if self.config.local_steps > 1:
+            # The estimate is applied locally so the next estimate is measured at
+            # the moved point; the coordinator sees only the last one.
+            self.apply_locally(grads)
+        if self.config.draws > 1:
+            stats["averagedDraws"] = self.config.draws
+        return grads, stats
+
     def run(self, rounds: int, log=print) -> dict[str, Any]:
         summary: dict[str, Any] = {"schema": "crowd-v15-client-run-1", "rounds": [], "dryRun": self.config.dry_run}
         for _ in range(rounds):
             manifest = self.sync()
             self.round_id = int(manifest.get("round", 0)) if "round" in manifest else self.round_id
+            averaged = None
             for step in range(self.config.local_steps):
-                started = time.perf_counter()
-                grads, stats = self.gradient(step=step)
-                stats["seconds"] = round(time.perf_counter() - started, 4)
-                if stats["seconds"] > 0:
-                    stats["tokensPerSecond"] = round(float(stats["tokens"]) / stats["seconds"], 1)
-                if self.config.probe_cosine and step == 0:
-                    idx, tgt = self.batch()
-                    stats["cosine"] = probe_cosine(self.model, self.dust_cfg, idx, tgt, base_seed=stats["baseSeed"], step=step)
-                if self.config.local_steps > 1:
-                    # The estimate is applied locally so the next estimate is
-                    # measured at the moved point; the coordinator sees only the
-                    # last one, with localSteps in the header.
-                    self.apply_locally(grads)
+                for draw in range(self.config.draws):
+                    grads, stats = self._one_draw(step if self.config.draws == 1 else draw,
+                                                  first=(draw == 0), averaged=averaged)
+                    averaged = grads if averaged is None else {
+                        name: averaged[name] + grads[name] for name in averaged}
+                grads = averaged if self.config.draws == 1 else {
+                    name: value / float(self.config.draws) for name, value in averaged.items()}
             if self.config.dry_run or self.config.offline:
                 receipt = {"accepted": None, "dryRun": True}
             else:

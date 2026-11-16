@@ -234,6 +234,38 @@ optimal at 1B; the monotone trend means the sweep has not found the top; and the
 declared norm is a claim by the *client*, so a coordinator that trusts it can be
 pushed around by one client claiming a large norm — `max_abs_grad` is the only cap.
 
+## Averaging draws inside a round
+
+DUST keeps no optimizer state, so *k* draws at the **same** weights are just a bigger
+Monte-Carlo batch: `--draws k` averages them client-side and uploads one estimate. The
+payload is unchanged (one estimate either way) and there is no local-drift failure mode,
+which is why it is a different knob from `--local-steps` (that one moves the model
+between estimates and trades staleness for progress).
+
+Gradient alignment against the backprop gradient, 10m preset, population 32, 2x16 tokens,
+induction task (`tools/bench_draws.py --mode cosine`):
+
+| draws | cosine | seconds |
+|---|---|---|
+| 1 | 0.1695 | 4.4 |
+| 2 | 0.2398 | 9.0 |
+| 4 | 0.3290 | 20.8 |
+| 8 | **0.4393** | 36.4 |
+
+And the loss effect at the tiny preset, 20 identity rounds, `ngd1`, outer optimizer on
+(`--outer-lr 0.7 --outer-momentum 0.9`):
+
+| draws | bytes/round | final loss |
+|---|---|---|
+| 1 | 126,900 | 1.4470 |
+| 2 | 127,918 | 1.0193 |
+| 4 | 130,315 | **0.4541** |
+
+Cost is linear in draws (the client does k times the work per round) and the payload grows
+slightly because a less noisy estimate is less compressible. The honest limit: this buys
+*Monte-Carlo* variance only. It cannot fix the estimator's bias, and it does nothing about
+the sigma/activation-scale mismatch behind the alignment numbers above.
+
 ## Measured (CPU, tiny preset)
 
 - `tests`: 119 passed in ~14 s (`protocol` 22, `coordinator` 18, `app` 17,
