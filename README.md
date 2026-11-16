@@ -160,10 +160,48 @@ A coordinator restart **drops** accepted-but-unapplied submissions rather than
 applying a step nobody can audit: the round number has not moved, so clients
 simply resubmit.
 
+## Error feedback
+
+The 1-bit containers are *biased*: every value in a block decodes to
+`±mean|x|`, so a small value far from its block mean lands well off target, and
+the same blocks are quantized the same way every round. Seide et al.
+(*1-bit SGD*, Interspeech 2014) showed this costs almost nothing **if the
+quantization error is carried forward** — encode `g + e` instead of `g`, then
+keep `e' = (g + e) - Q(g + e)` for the next round. Karimireddy et al.
+(*Error Feedback Fixes SignSGD*, ICML 2019) proved the property we rely on: with
+feedback the compression factor appears only as a second-order term, whereas
+sign-based compressors can actively diverge without it.
+
+`--error-feedback` enables it; the state lives on the client, so it survives
+rounds but not a restart (the first round after a restart sends the plain
+estimate). The header advertises `errorFeedback` and `residualNorm`, and the
+coordinator's audit log records the flag per submission.
+
+Measured with `tools/bench_feedback.py`, 30 identity-task rounds through the real
+coordinator (`lr 0.05`, `max_abs_grad 1.0`, tiny preset, population 8):
+
+| arm | bytes over dense | final loss | gap to dense |
+| --- | --- | --- | --- |
+| dense (bf16) | 1.00x | **3.7947** | — |
+| `ngd1` | 16.4x smaller | 4.1121 | +0.317 |
+| `ngd1r` | 8.1x smaller | 4.0070 | +0.212 |
+| `ngd1` + feedback | 15.8x smaller | **3.8863** | +0.092 |
+| `ngd1r` + feedback | 7.9x smaller | 3.8956 | +0.101 |
+
+So carrying the error recovers about 71 % of the accuracy the 1-bit codec gave
+up, at the same payload size.
+
+**What it does not buy.** `finalize` converts each submission to a unit direction
+and re-applies a capped magnitude, so feedback sharpens the *direction*, not the
+applied step size. On a biased quantizer whose blocks are already well scaled the
+gain is small; the win is concentrated where compression is most aggressive. The
+residual also assumes a stationary gradient — with a decaying one it can
+overshoot, which is why the round count and `lr` matter in the table above.
+
 ## Measured (CPU, tiny preset)
 
-- `tests`: 89 passed in ~15 s (`protocol` 22, `coordinator` 18, `app` 17,
-  `e2e` 4, `dust` estimator/training 28).
+- `tests`: 119 passed in ~14 s (`protocol` 22, `coordinator` 18, `app` 17,
+  `e2e` 4, `feedback` 11, `model` 16, `dust` estimator/training 29).
 - DUST gradient vs backprop gradient on the same batch (cosine, seed 0):
   **0.89** at population 64 on 1-layer d32; **0.55** on a 2-layer d64 model with
   per-layer draws (`mode="layer"`); **0.02** on the same 2-layer model when every

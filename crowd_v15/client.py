@@ -40,6 +40,7 @@ import torch
 
 from . import codec, protocol
 from .dust import DustConfig, DustOptimizer, dust_gradients, probe_cosine
+from .feedback import ErrorFeedback
 from .model import GPT, ModelConfig, canonical_params
 from .plain import check_plain_parameter_names
 from .store import weights_digest
@@ -78,6 +79,7 @@ class ClientConfig:
     dry_run: bool = False
     offline: bool = False
     probe_cosine: bool = False
+    error_feedback: bool = False
 
     def check(self) -> None:
         if self.codec not in codec.CODECS:
@@ -133,6 +135,9 @@ class DustClient:
         self.round_id = 0
         self.base_sha256 = ""
         self.history: list[dict[str, Any]] = []
+        # Error feedback lives across rounds, so it is client state, not a pure
+        # function of the current gradient.
+        self._feedback = ErrorFeedback(config.codec) if config.error_feedback else None
 
     # ---- server sync -----------------------------------------------------
 
@@ -217,6 +222,12 @@ class DustClient:
 
     def submit(self, grads: dict[str, torch.Tensor], stats: dict[str, Any]) -> dict[str, Any]:
         names, sizes, vector = protocol.flatten(grads)
+        feedback_stats: dict[str, Any] | None = None
+        if self._feedback is not None:
+            # Send g + carried error, and carry the new error forward. The
+            # coordinator averages unit directions, so this sharpens the
+            # direction rather than inflating the step.
+            vector, feedback_stats = self._feedback.encode(vector)
         extra = {
             "tokens": int(stats.get("tokens", 0)),
             "population": int(stats.get("population", self.config.population)),
@@ -229,6 +240,9 @@ class DustClient:
             "localSteps": int(self.config.local_steps),
             "params": int(sum(sizes)),
         }
+        if feedback_stats is not None:
+            extra["errorFeedback"] = True
+            extra["residualNorm"] = float(feedback_stats["residualNorm"])
         header = protocol.build_header(
             route="dust",
             client_id=self.client_id,
@@ -320,6 +334,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--offline", action="store_true",
                    help="train and measure without contacting a server")
     p.add_argument("--probe-cosine", action="store_true")
+    p.add_argument("--error-feedback", action="store_true",
+                   help="carry the quantization error of the upload across rounds")
     p.add_argument("--out", default="")
     return p.parse_args(argv)
 
@@ -333,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         lr=args.lr, momentum=args.momentum, grad_clip=args.grad_clip, codec=args.codec,
         device=args.device, compute_dtype=args.compute_dtype, local_steps=args.local_steps,
         seed=args.seed, timeout=args.timeout, dry_run=args.dry_run, offline=args.offline,
-        probe_cosine=args.probe_cosine,
+        probe_cosine=args.probe_cosine, error_feedback=args.error_feedback,
     )
     client = DustClient(config)
     summary = client.run(args.rounds)

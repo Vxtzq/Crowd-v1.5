@@ -266,6 +266,10 @@ class Coordinator:
             "clientId": client, "params": int(header["params"]),
             "tokens": estimate["tokens"], "population": estimate["population"],
             "sigma": estimate["sigma"], "weight": weight,
+            # Whether the client carried its quantization error forward. It does
+            # not change acceptance, but a round's audit trail should say which
+            # clients were compensating.
+            "errorFeedback": bool(header.get("errorFeedback")),
         })
         return {"route": route, "clientId": client, "weight": weight}
 
