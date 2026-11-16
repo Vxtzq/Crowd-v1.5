@@ -75,6 +75,7 @@ class ClientConfig:
     seed: int = 0
     timeout: float = DEFAULT_TIMEOUT
     dry_run: bool = False
+    offline: bool = False
     probe_cosine: bool = False
 
     def check(self) -> None:
@@ -136,6 +137,11 @@ class DustClient:
 
     def sync(self) -> dict[str, Any]:
         """Fetch the manifest and the weights, and check they agree."""
+        if self.config.offline:
+            self.base_sha256 = weights_digest(
+                {n: p.detach().cpu().float().numpy() for n, p in canonical_params(self.model).items()}
+            )
+            return {"offline": True, "baseSha256": self.base_sha256, "params": self.model.n_params}
         manifest = json.loads(_http(f"{self.config.server}/model/manifest", timeout=self.config.timeout))
         try:
             status = json.loads(_http(f"{self.config.server}/status", timeout=self.config.timeout))
@@ -253,7 +259,11 @@ class DustClient:
             manifest = self.sync()
             self.round_id = int(manifest.get("round", 0)) if "round" in manifest else self.round_id
             for step in range(self.config.local_steps):
+                started = time.perf_counter()
                 grads, stats = self.gradient(step=step)
+                stats["seconds"] = round(time.perf_counter() - started, 4)
+                if stats["seconds"] > 0:
+                    stats["tokensPerSecond"] = round(float(stats["tokens"]) / stats["seconds"], 1)
                 if self.config.probe_cosine and step == 0:
                     idx, tgt = self.batch()
                     stats["cosine"] = probe_cosine(self.model, self.dust_cfg, idx, tgt, base_seed=stats["baseSeed"], step=step)
@@ -262,7 +272,7 @@ class DustClient:
                     # measured at the moved point; the coordinator sees only the
                     # last one, with localSteps in the header.
                     self.apply_locally(grads)
-            if self.config.dry_run:
+            if self.config.dry_run or self.config.offline:
                 receipt = {"accepted": None, "dryRun": True}
             else:
                 receipt = self.submit(grads, stats)
@@ -305,6 +315,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--offline", action="store_true",
+                   help="train and measure without contacting a server")
     p.add_argument("--probe-cosine", action="store_true")
     p.add_argument("--out", default="")
     return p.parse_args(argv)
@@ -318,7 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         population=args.population, draw_chunk=args.draw_chunk, sigma=args.sigma, gamma=args.gamma,
         lr=args.lr, momentum=args.momentum, grad_clip=args.grad_clip, codec=args.codec,
         device=args.device, compute_dtype=args.compute_dtype, local_steps=args.local_steps,
-        seed=args.seed, timeout=args.timeout, dry_run=args.dry_run, probe_cosine=args.probe_cosine,
+        seed=args.seed, timeout=args.timeout, dry_run=args.dry_run, offline=args.offline,
+        probe_cosine=args.probe_cosine,
     )
     client = DustClient(config)
     summary = client.run(args.rounds)
