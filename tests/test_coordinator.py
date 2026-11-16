@@ -241,3 +241,39 @@ def test_estimator_fields_land_in_the_audit_log(booted):
     assert record["tokens"] == 4096
     assert record["population"] == 64
     assert record["weight"] == 4096
+
+def test_outer_nesterov_step_uses_its_own_learning_rate(store):
+    """DiLoCo's outer optimizer: a pseudo-gradient step size separate from ``lr``."""
+    tensors = model_tensors()
+    coord = Coordinator(store, CoordConfig(lr=1e-2, min_submissions=1,
+                                           outer_lr=0.7, outer_momentum=0.9))
+    coord.bootstrap(tensors)
+    names, sizes, vector = gradient_vector(tensors, seed=5, scale=1e-3)
+    coord.submit(submit_body(names, sizes, vector, codec_name="dense",
+                             base_sha256=coord.base_sha256))
+    assert coord.round_id == 1
+
+    norm = float(np.linalg.norm(vector))
+    magnitude = min(norm, coord.config.max_abs_grad)
+    pseudo = (vector / norm) * magnitude
+    # A zero buffer makes the first Nesterov step (1 + momentum) * outer_lr * p.
+    factor = coord.config.outer_lr * (1.0 + coord.config.outer_momentum)
+    after = coord.store.load_weights()
+    offset = 0
+    for name, size in zip(names, sizes):
+        chunk = pseudo[offset:offset + size]
+        before = np.asarray(tensors[name], dtype=np.float32).reshape(-1)
+        got = np.asarray(after[name], dtype=np.float32).reshape(-1)
+        # Weights are stored bf16, so compare the move, not the absolute value.
+        assert np.allclose(got - before, -factor * chunk, rtol=2e-2, atol=2e-6), name
+        offset += size
+    record = coord.status()["lastRound"]
+    assert record["outerLr"] == 0.7
+    assert record["outerMomentum"] == 0.9
+
+
+def test_outer_optimizer_rejects_bad_values():
+    with pytest.raises(ValueError):
+        CoordConfig(outer_lr=-1.0)
+    with pytest.raises(ValueError):
+        CoordConfig(outer_momentum=1.0)

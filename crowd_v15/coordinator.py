@@ -51,6 +51,12 @@ class Rejected(Exception):
 class CoordConfig:
     lr: float = 1e-3
     momentum: float = 0.0
+    # DiLoCo-style outer optimizer. ``outer_lr`` is the *pseudo-gradient*
+    # learning rate: DiLoCo's local-drift pseudo-gradient has a different scale
+    # from a minibatch gradient, so it needs its own step size rather than
+    # reusing ``lr``. 0 keeps the plain ``lr * g`` path untouched.
+    outer_lr: float = 0.0
+    outer_momentum: float = 0.0
     grad_clip: float = 0.0
     min_submissions: int = 2
     min_tokens: int = 1
@@ -64,6 +70,10 @@ class CoordConfig:
             raise ValueError("lr must be positive")
         if not (0.0 <= self.momentum < 1.0):
             raise ValueError("momentum must be in [0, 1)")
+        if self.outer_lr < 0:
+            raise ValueError("outer_lr must not be negative")
+        if not (0.0 <= self.outer_momentum < 1.0):
+            raise ValueError("outer_momentum must be in [0, 1)")
         if self.min_submissions < 1:
             raise ValueError("min_submissions must be at least 1")
         if self.grad_clip < 0:
@@ -89,6 +99,7 @@ class Coordinator:
         self.config = config or CoordConfig()
         self.model_meta = dict(model_meta or {})
         self._momentum: dict[str, np.ndarray] = {}
+        self._outer_momentum: dict[str, np.ndarray] = {}
         self._pending_vectors: dict[str, np.ndarray] = {}
         self._state = self._load_state()
 
@@ -99,6 +110,7 @@ class Coordinator:
         check_plain_parameter_names(tensors)
         digest = self.store.save_weights(tensors)
         self._momentum = {}
+        self._outer_momentum = {}
         self._state = {
             "schema": "crowd-v15-coordinator-1",
             "round": 0,
@@ -148,6 +160,8 @@ class Coordinator:
             "minSubmissions": self.config.min_submissions,
             "lr": self.config.lr,
             "momentum": self.config.momentum,
+            "outerLr": self.config.outer_lr,
+            "outerMomentum": self.config.outer_momentum,
             "gradClip": self.config.grad_clip,
             "acceptedThisRound": accepted,
             "acceptedByRoute": by_route,
@@ -310,8 +324,24 @@ class Coordinator:
         weights = self.store.load_weights()
         names = sorted(weights)
         update = protocol.unflatten(combined, names, [int(np.asarray(weights[n]).size) for n in names])
+        outer = float(self.config.outer_lr) > 0.0
         for name in names:
             grad = update[name].reshape(np.asarray(weights[name]).shape)
+            if outer:
+                # The aggregated estimate is a pseudo-gradient, not a minibatch
+                # gradient: it is the average of *directions* with a declared
+                # magnitude, so it does not shrink as the model approaches an
+                # optimum. Nesterov momentum is what DiLoCo's scaling work finds
+                # stable at this scale (lr 0.7, momentum 0.9).
+                if name not in self._outer_momentum:
+                    self._outer_momentum[name] = np.zeros_like(grad)
+                buf = self._outer_momentum[name]
+                buf *= float(self.config.outer_momentum)
+                buf += grad
+                step = buf * float(self.config.outer_momentum) + grad
+                weights[name] = (np.asarray(weights[name], dtype=np.float32)
+                                 - float(self.config.outer_lr) * step)
+                continue
             if name not in self._momentum:
                 self._momentum[name] = np.zeros_like(grad)
             if self.config.momentum:
@@ -334,6 +364,8 @@ class Coordinator:
             "clipped": clipped,
             "lr": self.config.lr,
             "momentum": self.config.momentum,
+            "outerLr": self.config.outer_lr,
+            "outerMomentum": self.config.outer_momentum,
             "tokens": int(sum(float(i["tokens"]) for i in pending.values())),
         }
         self._state = {

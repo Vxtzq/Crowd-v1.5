@@ -198,6 +198,42 @@ gain is small; the win is concentrated where compression is most aggressive. The
 residual also assumes a stationary gradient — with a decaying one it can
 overshoot, which is why the round count and `lr` matter in the table above.
 
+## Outer optimizer (pseudo-gradient momentum)
+
+The aggregated estimate is *not* a minibatch gradient. `finalize` averages unit
+directions and rescales them to the mean declared norm, so the result keeps a
+declared magnitude instead of shrinking as the model approaches an optimum. DiLoCo's
+scaling work consequently uses a separate **pseudo-gradient learning rate** (`0.7`)
+with Nesterov momentum (`0.9`) rather than a small SGD learning rate.
+
+`CoordConfig` exposes that as `outer_lr` / `outer_momentum` (both `0`, i.e. off, by
+default, which keeps the plain `lr * g` path byte-identical):
+
+```python
+CoordConfig(lr=1e-2, outer_lr=0.7, outer_momentum=0.9)
+```
+
+With a zero buffer the first step is `(1 + momentum) * outer_lr * p`; afterwards the
+buffer carries across rounds and across coordinator restarts only through the
+in-memory dict, so a restart begins with a cold buffer.
+
+Measured with `tools/bench_outer.py --rounds 30` (identity task, tiny preset,
+population 8, `max_abs_grad` 1.0, same batch and starting weights):
+
+| arm | final loss | vs plain |
+|---|---|---|
+| plain (`lr=0.05`) | 4.1121 | — |
+| `outer_lr=0.02`, mom 0.9 | 3.6876 | -0.4244 |
+| `outer_lr=0.05`, mom 0.9 | 3.2820 | -0.8300 |
+| `outer_lr=0.1`, mom 0.9 | 3.1070 | -1.0050 |
+| `outer_lr=0.7`, mom 0.9 | **0.5031** | **-3.6090** |
+
+Three honest limits: this is one easy task (identity copying) on a 1M-parameter
+model, so it says the outer step size is badly mis-scaled today, not that 0.7 is
+optimal at 1B; the monotone trend means the sweep has not found the top; and the
+declared norm is a claim by the *client*, so a coordinator that trusts it can be
+pushed around by one client claiming a large norm — `max_abs_grad` is the only cap.
+
 ## Measured (CPU, tiny preset)
 
 - `tests`: 119 passed in ~14 s (`protocol` 22, `coordinator` 18, `app` 17,
