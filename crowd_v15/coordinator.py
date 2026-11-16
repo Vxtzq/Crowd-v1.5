@@ -227,9 +227,16 @@ class Coordinator:
             if estimate["population"] < 1 or estimate["sigma"] <= 0:
                 raise Rejected("invalid_estimator_record",
                                "population and sigma must be positive for a DUST estimate")
+        # A DUST estimate's absolute scale is an artefact of ``sigma`` and the
+        # token count: a 64-token draw at sigma=1e-3 comes back with a norm near
+        # 1.5e5 on a 1B model, so an absolute peak bound rejects every honest
+        # submission. Normalise to a unit direction and keep the norm as a
+        # declared magnitude the round applies through ``max_abs_grad``.
+        norm = float(np.linalg.norm(vector)) if vector.size else 0.0
         peak = float(np.abs(vector).max()) if vector.size else 0.0
-        if not math.isfinite(peak) or peak > self.config.max_abs_grad:
-            raise Rejected("gradient_out_of_range", f"peak |g| = {peak:.3g}")
+        if not math.isfinite(norm) or not math.isfinite(peak):
+            raise Rejected("gradient_out_of_range", "estimate contains a non-finite value")
+        direction = vector if norm == 0.0 else (vector / norm).astype(np.float32)
 
         # Evidence weighting: a DUST estimate carries the token count it averaged
         # over; a backprop gradient is exact and gets unit weight.
@@ -243,8 +250,10 @@ class Coordinator:
             "population": estimate["population"],
             "sigma": estimate["sigma"],
             "gamma": estimate["gamma"],
+            "norm": norm,
+            "peak": peak,
         }
-        self._pending_vectors[client] = vector
+        self._pending_vectors[client] = direction
         self._state.setdefault("seenThisRound", {})[client] = int(time.time())
         accepted = int(self._state.get("acceptedThisRound", 0)) + 1
         by_route = dict(self._state.get("acceptedByRoute") or {})
@@ -275,18 +284,24 @@ class Coordinator:
         if not pending or not vectors:
             return None
         routes = {info["route"] for info in pending.values()}
-        total_weight = sum(float(i["weight"]) for i in pending.values())
+        # Directions are unit vectors, so plain averaging keeps one client from
+        # dominating on scale alone; the round's magnitude is the mean declared
+        # norm, capped by ``max_abs_grad`` (and by ``grad_clip`` when set).
+        count = len(pending)
         combined = None
-        for client, info in pending.items():
-            contribution = vectors[client].astype(np.float64) * (float(info["weight"]) / total_weight)
+        for client in pending:
+            contribution = vectors[client].astype(np.float64) / count
             combined = contribution if combined is None else combined + contribution
-        combined = combined.astype(np.float32)
+        declared = float(sum(float(i.get("norm", 0.0)) for i in pending.values()) / count)
+        magnitude = min(declared, float(self.config.max_abs_grad))
+        combined = (combined * magnitude).astype(np.float32)
 
         norm = float(np.linalg.norm(combined))
-        clipped = False
+        clipped = magnitude < declared
         if self.config.grad_clip > 0 and norm > self.config.grad_clip:
             combined = (combined * (self.config.grad_clip / norm)).astype(np.float32)
             clipped = True
+            norm = float(np.linalg.norm(combined))
 
         weights = self.store.load_weights()
         names = sorted(weights)
@@ -311,6 +326,7 @@ class Coordinator:
             "byRoute": {r: sum(1 for i in pending.values() if i["route"] == r) for r in sorted(routes)},
             "route": sorted(routes)[0] if len(routes) == 1 else "mixed",
             "gradNorm": round(norm, 6),
+            "declaredNorm": round(declared, 6),
             "clipped": clipped,
             "lr": self.config.lr,
             "momentum": self.config.momentum,

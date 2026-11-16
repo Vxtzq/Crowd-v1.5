@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from crowd_v15 import protocol
+from crowd_v15.protocol import ProtocolError
 from crowd_v15.coordinator import CoordConfig, Coordinator, Rejected
 from crowd_v15.store import ModelStore, StoreError, weights_digest
 
@@ -138,13 +139,39 @@ def test_closed_route_is_refused(booted):
     assert exc.value.reason == "route_disabled"
 
 
-def test_out_of_range_gradient_is_refused(booted):
-    coord, tensors = booted
-    coord.config.max_abs_grad = 1e-6
-    with pytest.raises(Rejected) as exc:
-        _submit(coord, tensors)
-    assert exc.value.reason == "gradient_out_of_range"
+def test_huge_norm_estimate_is_capped_not_refused(booted):
+    """A DUST estimate at sigma=1e-3 has a norm near 1e5 on a 1B model.
 
+    An absolute peak bound rejected every honest submission, so the coordinator
+    normalises to a direction and applies the declared norm capped by
+    ``max_abs_grad``.
+    """
+    coord, tensors = booted
+    coord.config.max_abs_grad = 1e-3
+    names, sizes, vector = gradient_vector(tensors, scale=1e4)
+    coord.submit(submit_body(names, sizes, vector, client_id="huge", round_id=coord.round_id,
+                             base_sha256=coord.base_sha256, codec_name="dense", tokens=64, population=2, sigma=1e-3))
+    record = coord.status()["lastRound"]
+    assert record is not None
+    assert record["declaredNorm"] > 1e3
+    assert record["gradNorm"] <= 1e-3 + 1e-6
+    assert record["clipped"] is True
+    assert record["route"] == "dust"
+
+
+def test_non_finite_estimate_is_refused(booted):
+    import numpy as np
+
+    coord, tensors = booted
+    names, sizes, vector = gradient_vector(tensors)
+    vector = vector.copy()
+    vector[3] = np.inf
+    # The wire format refuses a non-finite vector before the coordinator's own
+    # guard can see it, which is the stronger of the two checks.
+    with pytest.raises(ProtocolError):
+        coord.submit(submit_body(names, sizes, vector, client_id="nan", round_id=coord.round_id,
+                                 base_sha256=coord.base_sha256, codec_name="dense", tokens=64,
+                                 population=2, sigma=1e-3))
 
 def test_gradient_clip_scales_the_step(booted):
     coord, tensors = booted

@@ -195,7 +195,38 @@ before the graph). The cost driver is visible in the same numbers: per-layer
 passes turn one token of evidence into ~2.4 forwards of a 1B model (153 / 64), so
 throughput is dominated by the pass structure, not the arithmetic.
 
+## Measured on a 16 GB consumer card (1B, CUDA)
+
+Same `1b` preset (1,015,085,056 parameters, bf16) on an RTX 4060 Ti 16 GB,
+torch 2.6.0+cu124, for the cross-vendor comparison:
+
+| measurement | RTX 4060 Ti | Radeon 890M |
+|---|---|---|
+| weights at bf16 | 2.03 GB | 1.89 GB |
+| forward, seq 8 | 0.27 s, 2.07 GB reserved | 0.29 s, 1.96 GB reserved |
+| DUST step, seq 32, bs 1, population 2 | **2.08 s**, 153 forwards, **6.47 GB** | 8.18 s, 153 forwards, 6.06 GB |
+| evidence throughput | **30.7 tok/s** (73.5 forwards/s) | 7.8 tok/s (18.7 forwards/s) |
+
+So gate 1 of the pitch holds on consumer hardware with room to spare: a
+literal-1B DUST step fits in **6.5 GB**, leaving ~9 GB of the card for a bigger
+population or longer sequences. The same shapes run 3.9x faster on CUDA than on
+the 8-CU APU, which is the first hardware-class comparison of this method we have.
+
+## How a round scales submissions
+
+The absolute scale of an ES estimate is an artefact of `sigma` and the token
+count: a 64-token draw at `sigma = 1e-3` came back with a norm of **1.5e5** on the
+1B model, so any fixed bound on `|g|` rejects every honest client.
+
+So the coordinator normalises each submission to a unit direction at accept time,
+keeps the declared norm in the round record, and applies the *mean declared norm*,
+capped by `max_abs_grad` (and by `grad_clip` when set). Direction is what an ES
+step needs; magnitude is the coordinator's learning rate times a bounded,
+auditable number. A non-finite estimate never reaches the coordinator — the wire
+format rejects it first.
+
 ## Honest limits
+
 
 - The estimator is validated on tiny CPU models (cosine 0.89 at 1 layer, 0.55 at
   two with per-layer draws); the 1B numbers below are *mechanism* numbers from a
