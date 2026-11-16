@@ -302,10 +302,14 @@ def probe_cosine(model: GPT, cfg: DustConfig, idx: torch.Tensor, tgt: torch.Tens
 
     grouped: dict[str, list[float]] = {}
     flat_dust, flat_ref = [], []
+    # With tied embeddings the head's weights are ``tok_emb.weight``, so comparing
+    # against the literal name "head.weight" silently bucketed the embedding with
+    # the MLP blocks. Resolve the canonical key instead.
+    head_key = _head_name(model)
     for name, value in per_layer.items():
         if value is None:
             continue
-        kind = "head" if name == "head.weight" else (
+        kind = "embedding" if name == head_key else (
             "attn" if ".attn." in name else "mlp"
         )
         grouped.setdefault(kind, []).append(value)

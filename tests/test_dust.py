@@ -176,6 +176,18 @@ class EstimatorTests(unittest.TestCase):
         self.assertGreater(report["byType"]["attn"], 0.15)
         self.assertGreater(report["byType"]["mlp"], 0.15)
 
+    def test_cosine_probe_buckets_the_tied_embedding_separately(self):
+        # The head shares ``tok_emb.weight``, so a name == "head.weight" test
+        # silently folded the embedding into the mlp bucket.
+        model = build()
+        gen = torch.Generator().manual_seed(5)
+        idx, tgt = induction_batch(2, 8, model.tok_emb.num_embeddings, torch.device("cpu"), gen)
+        report = probe_cosine(model, config(population=4, draw_chunk=4), idx, tgt,
+                              base_seed=3, step=0)
+        self.assertIn("embedding", report["byType"])
+        self.assertNotIn("head", report["byType"])
+        self.assertIn("tok_emb.weight", report["perLayer"])
+
     def test_isolating_layers_beats_perturbing_them_together(self):
         # The paper's interference control: jittering every layer at once sums
         # their effects into one reward, so each layer's own signal is diluted.
